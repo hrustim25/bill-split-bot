@@ -483,9 +483,9 @@ def main():
 
     application.add_handler(CallbackQueryHandler(button_callback))
 
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_unknown_message))
-
     application.add_handler(MessageHandler(filters.TEXT & filters.REPLY, handle_reply_message))
+
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_unknown_message))
 
     application.run_polling()
 
