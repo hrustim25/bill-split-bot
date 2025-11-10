@@ -1,2 +1,11 @@
 # bill-split-bot
-Telegram bot for managing expenses on group trips
+
+Телеграм-бот для рассчета совместных затрат в поездках
+
+# Конфигурация
+
+Для работы нужно добавить файл config.py с переменной:
+```
+BOT_TOKEN=<токен бота>
+```
+
