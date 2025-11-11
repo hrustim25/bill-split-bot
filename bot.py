@@ -17,6 +17,7 @@ from telegram.ext import (
     ContextTypes,
     CallbackQueryHandler
 )
+import ocr
 
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -241,7 +242,8 @@ async def create_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     user_states[user.id] = "waiting_title"
-    await update.message.reply_text("Введите название платежа:")
+    await update.message.reply_text("Введите название платежа или прикрепите чек:")
+
 
 
 async def handle_payment_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -499,6 +501,43 @@ async def handle_unknown_message(update: Update, context: ContextTypes.DEFAULT_T
         if update.message.chat.type == "private":
             await update.message.reply_text("Выберите действие из меню ниже:", reply_markup=get_main_keyboard())
 
+
+async def get_payment_from_photo(update, context):
+    photo = update.message.photo[-1]
+    file_id = photo.file_id
+    file = await context.bot.get_file(file_id)
+    file_url = file.file_path
+    description = 'Данные из чека'
+    amount = ocr.get_total_by_url(file_url)
+    return description, amount
+
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.message.from_user
+    if update.message.reply_to_message:
+        return
+    state = user_states.get(user.id)
+    photos = update.message.photo
+    if state == "waiting_title" and photos and len(photos) > 1:
+        description, amount = await get_payment_from_photo(update, context)
+        if amount is not None:
+            payment = {
+                'description': description,
+                'user_id': user.id,
+                'created_by': user.first_name,
+                'chat_id': update.message.chat.id,
+                'timestamp': datetime.now().strftime("%d.%m.%Y %H:%M"),
+                'amount': amount,
+            }
+            context.user_data['pending_payment'] = payment
+            del user_states[user.id]
+            await update.message.reply_text(
+                f"Проверьте данные:\n\nНазвание: {payment['description']}\nСумма: {payment['amount']} руб.\nСоздал: {payment['created_by']}\n\nПодтвердить создание платежа?",
+                reply_markup=get_confirmation_keyboard()
+            )
+        else:
+            await update.message.reply_text(f"Не удалось распознать данные из чека, напишите текстом")
+
+
 def main():
     init_database()
     application = Application.builder().token(BOT_TOKEN).build()
@@ -519,6 +558,7 @@ def main():
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_payment_input))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_unknown_message))
 
+    application.add_handler(MessageHandler(filters.PHOTO & ~filters.COMMAND, handle_photo))
     application.run_polling()
 
 if __name__ == '__main__':
