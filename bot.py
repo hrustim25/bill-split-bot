@@ -1,6 +1,8 @@
 import config
 import logging
 import sqlite3
+import html
+import debts_optimizer
 from datetime import datetime
 from telegram import (
     Update,
@@ -100,7 +102,8 @@ def get_main_keyboard():
     keyboard = [
         [KeyboardButton("Создать платеж"), KeyboardButton("Баланс")],
         [KeyboardButton("Мой долг"), KeyboardButton("Общий долг")],
-        [KeyboardButton("История платежей")]
+        [KeyboardButton("История платежей")],
+        [KeyboardButton("Оптимизация долгов")]
     ]
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
@@ -230,6 +233,8 @@ async def handle_main_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE
         await show_total_debt(update, context)
     elif text == "История платежей":
         await show_payment_history(update, context)
+    elif text == "Оптимизация долгов":
+        await optimize_debts(update, context)
 
 async def create_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.message.from_user
@@ -538,6 +543,92 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"Не удалось распознать данные из чека, напишите текстом")
 
 
+async def optimize_debts(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Запустить оптимизацию долгов: получить план переводов, отправить и закрепить сообщение с упоминаниями, затем пометить старые долги как оплаченные."""
+    # только в группах
+    if update.effective_chat.type == 'private':
+        await update.message.reply_text('Оптимизация долгов доступна только в групповых чатах.')
+        return
+
+    chat_id = update.effective_chat.id
+    await update.message.reply_text('Формирую план переводов...')
+
+    try:
+        transfers = debts_optimizer.optimize_transfers_with_allocations('expenses.db')
+    except Exception as e:
+        logger.exception('Ошибка при запуске оптимизатора: %s', e)
+        await update.message.reply_text('Ошибка при формировании плана переводов. Смотрите логи.')
+        return
+
+    if not transfers:
+        await update.message.reply_text('Нет активных задолженностей для оптимизации.')
+        return
+
+    # сгруппируем переводы по валютам
+    by_currency = {}
+    involved = set()
+    for t in transfers:
+        cur = t.get('currency', 'RUB')
+        by_currency.setdefault(cur, []).append(t)
+        involved.add(t['from'])
+        involved.add(t['to'])
+
+    # получим имена для упоминаний
+    try:
+        users = dict(debts_optimizer.get_all_users('expenses.db'))
+    except Exception:
+        users = {}
+
+    lines = ['План переводов (оптимизация):']
+    # сортируем валюты для стабильного вывода
+    # human-readable currency labels
+    currency_labels = {
+        'RUB': 'RUB ₽',
+        'USD': 'USD $',
+        'EUR': 'EUR €'
+    }
+
+    for cur in sorted(by_currency.keys()):
+        label = currency_labels.get(cur, cur)
+        lines.append(f'=== {label} ===')
+        for t in by_currency[cur]:
+            name_from = html.escape(users.get(t['from'], str(t['from'])))
+            name_to = html.escape(users.get(t['to'], str(t['to'])))
+            lines.append(f"{name_from} -> {name_to}: {t['amount']:.2f} {cur}")
+
+    mentions = []
+    for uid in sorted(involved):
+        pname = html.escape(users.get(uid, str(uid)))
+        mentions.append(f'<a href="tg://user?id={uid}">{pname}</a>')
+
+    full_text = "\n".join(lines)
+    if mentions:
+        full_text += "\n\nУчастники: " + ", ".join(mentions)
+
+    # Отправляем и закрепляем
+    try:
+        sent = await context.bot.send_message(chat_id=chat_id, text=full_text, parse_mode='HTML', disable_web_page_preview=True)
+    except Exception as e:
+        logger.exception('Не удалось отправить сообщение с планом: %s', e)
+        await update.message.reply_text('Не удалось отправить план переводов. Смотрите логи.')
+        return
+
+    try:
+        await context.bot.pin_chat_message(chat_id=chat_id, message_id=sent.message_id)
+    except Exception as e:
+        logger.warning('Не удалось закрепить сообщение: %s', e)
+
+    # Пометка только тех аллокаций, которые использовались
+    try:
+        debts_optimizer.mark_allocations_paid('expenses.db', transfers)
+    except Exception as e:
+        logger.exception('Ошибка при пометке аллокаций как оплаченных: %s', e)
+        await update.message.reply_text('План сформирован, но не удалось пометить задействованные доли как оплаченные. Смотрите логи.')
+        return
+
+    await update.message.reply_text('Задействованные долги помечены как оплаченные')
+
+
 def main():
     init_database()
     application = Application.builder().token(BOT_TOKEN).build()
@@ -546,10 +637,12 @@ def main():
     application.add_handler(CommandHandler("balance", show_balance))
     application.add_handler(CommandHandler("my_debt", show_my_debt))
     application.add_handler(CommandHandler("total_debt", show_total_debt))
+    application.add_handler(CommandHandler("optimize", optimize_debts))
+    application.add_handler(CommandHandler("optimize_debts", optimize_debts))
     application.add_handler(CommandHandler("history", show_payment_history))
 
     application.add_handler(MessageHandler(
-        filters.Text(["Создать платеж", "Баланс", "Мой долг", "Общий долг", "История платежей"]),
+        filters.Text(["Создать платеж", "Баланс", "Мой долг", "Общий долг", "История платежей", "Оптимизация долгов"]),
         handle_main_buttons
     ))
 
