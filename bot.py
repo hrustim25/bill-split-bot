@@ -602,17 +602,40 @@ async def show_payment_history(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.message.reply_text("История платежей пуста")
         return
 
-    # Индексы: смотрим SELECT e.*, u.name, c.name
     # e.* = [0:id,1:amount,2:currency,3:event_id,4:name,5:paid_date,6:user_id,7:message_id,8:category_id]
+    # затем JOIN user u.name -> index 9, LEFT JOIN category c.name -> index 10
     history_text = "Последние платежи:\n\n"
     for p in payments:
+        payment_id = p[0]
         amount = p[1]
         currency = p[2]
         name = p[4]
         paid_date = p[5] or ""
         payer_name = p[9]
         category_name = p[10] or "Без категории"
-        history_text += f"• {paid_date} | {payer_name} | {category_name}\n   {amount:.2f} {currency} — {name}\n\n"
+
+        history_text += (
+            f"• {paid_date} | {payer_name} | {category_name}\n"
+            f"   {amount:.2f} {currency} — {name}\n"
+        )
+
+        # Подтянем должников по этому платежу (только активные долги)
+        shares = get_shares_for_payment(payment_id)
+        # shares: ep.* + u.name => [0:id,1:amount,2:expense_id,3:is_paid,4:user_id,5:user_name]
+        debtors_lines = []
+        for s in shares:
+            is_paid = s[3]
+            if is_paid:  # показываем только должников с не закрытым долгом
+                continue
+            debtor_name = s[5]
+            debtor_amount = float(s[1])
+            debtors_lines.append(f"   • {debtor_name}: {debtor_amount:.2f}")
+
+        if debtors_lines:
+            history_text += "   Список должников:\n" + "\n".join(debtors_lines) + "\n"
+
+        history_text += "\n"
+
     await update.message.reply_text(history_text)
 
 async def handle_unknown_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -641,7 +664,11 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     state = user_states.get(user.id)
     photos = update.message.photo
     if state == "waiting_title" and photos:
+        wait_message = await update.message.reply_text(
+            f"Обрабатываю изображение..."
+        )
         description, amount = await get_payment_from_photo(update, context)
+        await context.bot.deleteMessage(message_id=wait_message.message_id, chat_id=update.message.chat_id)
         if amount is not None:
             payment = {
                 'description': description,
