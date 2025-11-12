@@ -55,13 +55,16 @@ def optimize_transfers(db_path='expenses.db'):
     by_currency = defaultdict(list)
     for ep_id, debtor_id, creditor_id, amount, currency, expense_id in rows:
         cur = _normalize_currency(currency)
-        by_currency[cur].append((debtor_id, creditor_id, amount))
+        # сохраняем id строки и сумму — понадобится для reciprocal matching
+        by_currency[cur].append((ep_id, debtor_id, creditor_id, amount, expense_id))
 
     transfers = []
     for cur, recs in by_currency.items():
         # баланс в копейках
         bal = defaultdict(int)
-        for debtor, creditor, amount in recs:
+        for rec in recs:
+            # rec: (ep_id, debtor, creditor, amount, expense_id)
+            _, debtor, creditor, amount, _ = rec
             cents = _to_cents(amount)
             if debtor == creditor:
                 continue
@@ -93,6 +96,47 @@ def optimize_transfers(db_path='expenses.db'):
                 i += 1
             if j < len(creditors) and creditors[j][1] == 0:
                 j += 1
+
+    # Если нет чистых переводов (балансы по валюте компенсируются),
+    # попробуем найти взаимные непогашенные записи (A->B и B->A) и сформировать
+    # переводы для взаимного зачёта — это пометит соответствующие expense_participant как оплаченные.
+    if not transfers:
+        for cur, recs in by_currency.items():
+            # постоим словарь пар (debtor, creditor) -> список [ep_id, available_cents]
+            edges = defaultdict(list)
+            for ep_id, debtor, creditor, amount, expense_id in recs:
+                if debtor == creditor:
+                    continue
+                edges[(debtor, creditor)].append([ep_id, _to_cents(amount)])
+
+            # для каждой пары (u,v) и (v,u) попытаемся попарно сопоставить суммы
+            seen = set()
+            for (u, v) in list(edges.keys()):
+                if (u, v) in seen:
+                    continue
+                if (v, u) not in edges:
+                    continue
+                a_list = edges[(u, v)]
+                b_list = edges[(v, u)]
+                # индексы для прохода по спискам
+                ia = 0
+                ib = 0
+                while ia < len(a_list) and ib < len(b_list):
+                    a_id, a_amt = a_list[ia]
+                    b_id, b_amt = b_list[ib]
+                    take = min(a_amt, b_amt)
+                    if take > 0:
+                        # создаём два зеркальных перевода — один для списания долга u->v, и один v->u
+                        transfers.append((u, v, _from_cents(take), cur))
+                        transfers.append((v, u, _from_cents(take), cur))
+                        a_list[ia][1] -= take
+                        b_list[ib][1] -= take
+                    if a_list[ia][1] == 0:
+                        ia += 1
+                    if b_list[ib][1] == 0:
+                        ib += 1
+                seen.add((u, v))
+                seen.add((v, u))
 
     if os.environ.get('DEBTS_DEBUG'):
         print('optimize_transfers ->', transfers)
@@ -211,7 +255,7 @@ def mark_allocations_paid(db_path, transfers_with_allocs):
         conn.close()
 
 
-def mark_all_unpaid_as_paid(db_path='expenses.db'):
+def mark_all_unpaid_as_paid(db_path='expense.db'):
     conn = sqlite3.connect(db_path)
     cur = conn.cursor()
     cur.execute('UPDATE expense_participant SET is_paid = 1 WHERE is_paid = 0')
