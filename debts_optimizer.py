@@ -1,24 +1,24 @@
 import sqlite3
-
-# edges: Dict[int, Dict[int, float]]  # edges[from_id][to_id] = amount
+import os
+from collections import defaultdict
 
 
 def _aggregate_edges(rows):
-    edges = {}
+    """Агрегировать ребра (debtor->creditor) и округлить суммы."""
+    edges = defaultdict(lambda: defaultdict(float))
     for debtor_id, creditor_id, amount in rows:
         if debtor_id == creditor_id:
             continue
-        edges.setdefault(debtor_id, {})
-        edges[debtor_id][creditor_id] = edges[debtor_id].get(creditor_id, 0.0) + float(amount)
-    # round amounts
-    for u in list(edges.keys()):
-        for v in list(edges[u].keys()):
-            edges[u][v] = round(edges[u][v], 2)
-            if edges[u][v] <= 0.005:
-                del edges[u][v]
-        if not edges[u]:
-            del edges[u]
-    return edges
+        edges[debtor_id][creditor_id] += float(amount)
+
+    # округление и удаление нулей
+    clean = {}
+    for u, targets in edges.items():
+        for v, a in list(targets.items()):
+            a = round(a, 2)
+            if a > 0.005:
+                clean.setdefault(u, {})[v] = a
+    return clean
 
 
 def build_debt_graph(db_path='expenses.db'):
@@ -59,32 +59,33 @@ def build_debt_graph(db_path='expenses.db'):
     conn.close()
 
     user_ids = [r[0] for r in user_rows]
+    if os.environ.get('DEBTS_DEBUG'):
+        print('build_debt_graph edges_by_currency=', edges_by_currency)
     return edges_by_currency, user_ids
 
 
 def _find_cycle(edges):
-    # nodes -> all keys and targets
+    """Найти любую простую ориентированную цикл-цепочку в графе edges или вернуть None.
+    edges: {u: {v: amount}}
+    Возвращает список узлов [v1, v2, ..., v1]"""
     nodes = set(edges.keys())
-    for u in list(edges.keys()):
-        for v in edges.get(u, {}).keys():
-            nodes.add(v)
+    for u, targets in edges.items():
+        nodes.update(targets.keys())
 
     visited = set()
-    stack = []
     onstack = set()
+    stack = []
 
     def dfs(u):
         visited.add(u)
-        stack.append(u)
         onstack.add(u)
-
+        stack.append(u)
         for v in edges.get(u, {}):
             if edges[u].get(v, 0) <= 0:
                 continue
             if v in onstack:
                 idx = stack.index(v)
-                cycle = stack[idx:] + [v]
-                return cycle
+                return stack[idx:] + [v]
             if v not in visited:
                 res = dfs(v)
                 if res:
@@ -102,62 +103,55 @@ def _find_cycle(edges):
 
 
 def _cancel_cycles(edges):
-    # repeatedly find a directed cycle and reduce weights along it
+    """Пока есть цикл — уменьшаем по минимальному ребру вдоль него."""
+    # работаем на изменяемой структуре
     while True:
         cycle = _find_cycle(edges)
         if not cycle:
             break
-        # cycle is like [v, ..., v]
-        pairs = []
-        for i in range(len(cycle) - 1):
-            a = cycle[i]
-            b = cycle[i + 1]
-            pairs.append((a, b))
+        pairs = [(cycle[i], cycle[i + 1]) for i in range(len(cycle) - 1)]
         minamt = min(edges[a][b] for a, b in pairs)
         minamt = round(minamt, 2)
         for a, b in pairs:
             edges[a][b] = round(edges[a][b] - minamt, 2)
             if edges[a][b] <= 0.005:
                 del edges[a][b]
-        # cleanup empty keys
-        empty = [k for k, v in edges.items() if not v]
-        for k in empty:
+        # удалить пустые вершины
+        for k in [k for k, v in list(edges.items()) if not v]:
             del edges[k]
     return edges
 
 
 def _net_mutual(edges):
-    # for any pair (u,v) and (v,u) net the amounts so only one direction remains
-    seen = set()
+    """Для каждой пары (u,v) и (v,u) неттим суммы, оставляя одну сторону."""
+    # собираем пары для обработки, чтобы не ломать итерирование
     for u in list(edges.keys()):
         for v in list(edges.get(u, {}).keys()):
-            if (u, v) in seen or (v, u) in seen:
+            if u == v:
                 continue
-            amt_uv = edges.get(u, {}).get(v, 0.0)
-            amt_vu = edges.get(v, {}).get(u, 0.0)
-            if amt_uv and amt_vu:
-                if amt_uv > amt_vu:
-                    edges[u][v] = round(amt_uv - amt_vu, 2)
-                    # remove reverse
+            a = edges.get(u, {}).get(v, 0)
+            b = edges.get(v, {}).get(u, 0)
+            if a and b:
+                if a > b:
+                    edges[u][v] = round(a - b, 2)
                     if v in edges and u in edges[v]:
                         del edges[v][u]
-                elif amt_vu > amt_uv:
-                    edges[v][u] = round(amt_vu - amt_uv, 2)
+                elif b > a:
+                    edges[v][u] = round(b - a, 2)
                     if u in edges and v in edges[u]:
                         del edges[u][v]
                 else:
-                    # equal -> remove both
-                    del edges[u][v]
-                    if v in edges and u in edges[v]:
+                    # равны — удаляем обе
+                    if v in edges.get(u, {}):
+                        del edges[u][v]
+                    if u in edges.get(v, {}):
                         del edges[v][u]
-            seen.add((u, v))
-            seen.add((v, u))
-    # cleanup zeros/empties
-    for u in list(edges.keys()):
-        for v in list(edges[u].keys()):
+    # убрать нулевые и пустые
+    for u in [k for k, v in list(edges.items())]:
+        for v in [t for t in list(edges.get(u, {}).keys())]:
             if edges[u][v] <= 0.005:
                 del edges[u][v]
-        if not edges[u]:
+        if not edges.get(u):
             del edges[u]
     return edges
 
@@ -167,112 +161,173 @@ def optimize_transfers(db_path='expenses.db'):
 
     Возвращает список кортежей (from_id, to_id, amount, currency)
     """
-    edges_by_currency, _ = build_debt_graph(db_path)
-    if not edges_by_currency:
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+
+    cursor.execute('''
+        SELECT ep.user_id as debtor_id, e.user_id as creditor_id, ep.amount, COALESCE(UPPER(TRIM(e.currency)), 'RUB') as currency
+        FROM expense_participant ep
+        JOIN expense e ON ep.expense_id = e.id
+        WHERE ep.is_paid = 0
+    ''')
+    rows = cursor.fetchall()
+    conn.close()
+
+    if not rows:
         return []
 
-    all_transfers = []
-    for currency, edges in edges_by_currency.items():
-        if not edges:
-            continue
-        # copy to avoid mutating original
-        local_edges = {u: dict(targets) for u, targets in edges.items()}
-        local_edges = _cancel_cycles(local_edges)
-        local_edges = _net_mutual(local_edges)
-        for u, targets in local_edges.items():
+    # Построим ребра по валютам и агрегируем напрямую
+    by_currency = defaultdict(list)
+    for debtor_id, creditor_id, amount, currency in rows:
+        by_currency[currency].append((debtor_id, creditor_id, amount))
+
+    final_transfers = []
+    for cur, recs in by_currency.items():
+        edges = _aggregate_edges(recs)
+        edges = _cancel_cycles(edges)
+        edges = _net_mutual(edges)
+        # собрать финальные переводы
+        for u, targets in edges.items():
             for v, amt in targets.items():
                 if amt and amt > 0.005:
-                    all_transfers.append((u, v, round(amt, 2), currency))
-    return all_transfers
+                    final_transfers.append((u, v, round(amt, 2), cur))
+
+    if os.environ.get('DEBTS_DEBUG'):
+        print('optimize_transfers transfers=', final_transfers)
+    return final_transfers
 
 
 def optimize_transfers_with_allocations(db_path='expenses.db'):
-    """Оптимизирует переводы (по валютам) и сопоставляет каждый перевод с конкретными
-    записями expense_participant (непогашёнными).
+    """Новый вариант: выполняет неттирование по пользователям и сопоставляет переводы с конкретными непогашёнными записями должников.
 
-    Возвращает список переводов в формате:
-      { 'from': uid_from, 'to': uid_to, 'amount': amt, 'currency': cur, 'allocs': [ (ep_id, used_amount, expense_id, original_amount) ] }
-
-    allocs — список пар (id доли, сколько из неё используется для погашения).
+    Возвращает список словарей: {from,to,amount,currency,allocs}
+    where allocs = [(ep_id, used, expense_id, original_amount), ...]
     """
+    # сначала получаем переводы неттирования (direct transfers)
     transfers = optimize_transfers(db_path)
     if not transfers:
         return []
+
+    # агрегируем переводы по (from,to,currency)
+    agg = {}
+    for frm, to, amount, currency in transfers:
+        key = (frm, to, currency)
+        agg[key] = agg.get(key, 0.0) + float(amount)
+    if os.environ.get('DEBTS_DEBUG'):
+        print('optimize_transfers_with_allocations agg=', agg)
 
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
 
     detailed = []
+    debtor_cache = {}  # key: (user_id, currency) -> list of (ep.id, amount, expense_id)
 
-    for frm, to, amt, currency in transfers:
-        remaining = float(amt)
+    # теперь создаём аллокации для каждой агрегированной пары
+    for (frm, to, currency), total_amount in agg.items():
+        # currency coming from optimize_transfers should already be normalized, but normalize again to be safe
+        cur = (currency or 'RUB').strip().upper()
+        remaining = round(float(total_amount), 2)
         allocs = []
-        # получаем непогашённые записи, относящиеся к этому дебету: ep.user_id = frm, expense.user_id = to, currency match
-        cursor.execute('''
-            SELECT ep.id, ep.amount, ep.expense_id
-            FROM expense_participant ep
-            JOIN expense e ON ep.expense_id = e.id
-            WHERE ep.is_paid = 0 AND ep.user_id = ? AND e.user_id = ? AND e.currency = ?
-            ORDER BY ep.id ASC
-        ''', (frm, to, currency))
 
-        rows = cursor.fetchall()
-        for ep_id, ep_amount, expense_id in rows:
-            if remaining <= 0.005:
-                break
-            take = min(float(ep_amount), remaining)
+        cache_key = (frm, cur)
+        if cache_key not in debtor_cache:
+            # match currency same way as in optimize_transfers: COALESCE(UPPER(TRIM(e.currency)), 'RUB')
+            cursor.execute('''
+                SELECT ep.id, ep.amount, ep.expense_id
+                FROM expense_participant ep
+                JOIN expense e ON ep.expense_id = e.id
+                WHERE ep.is_paid = 0 AND ep.user_id = ? AND COALESCE(UPPER(TRIM(e.currency)), 'RUB') = ?
+                ORDER BY ep.id ASC
+            ''', (frm, cur))
+            debtor_cache[cache_key] = list(cursor.fetchall())
+
+        rows = debtor_cache[cache_key]
+        idx = 0
+        while remaining > 0.005 and idx < len(rows):
+            ep_id, ep_amount, expense_id = rows[idx]
+            available = float(ep_amount)
+            if available <= 0.005:
+                idx += 1
+                continue
+            take = min(available, remaining)
             take = round(take, 2)
             if take <= 0:
+                idx += 1
                 continue
             allocs.append((ep_id, take, expense_id, float(ep_amount)))
             remaining = round(remaining - take, 2)
+            # update cached available amount
+            rows[idx] = (ep_id, round(available - take, 2), expense_id)
+            if rows[idx][1] <= 0.005:
+                idx += 1
 
-        if remaining > 0.01:
-            # Непредвиденная ситуация: суммы не сходятся — логируем и продолжаем (останется непогашённая часть)
-            # Но так как граф строился из этих записей, это маловероятно.
-            # Мы не бросаем ошибку, а вернём частичную аллокацию.
-            pass
+        # Если не получилось закрыть всю сумму — это ошибка согласованности данных
+        if remaining > 0.005:
+            conn.close()
+            raise Exception(f"Не удалось собрать сумму {frm}->{to} {total_amount} {cur}: осталось {remaining}")
 
-        detailed.append({
-            'from': frm,
-            'to': to,
-            'amount': round(float(amt), 2),
-            'currency': currency,
-            'allocs': allocs
-        })
+        detailed.append({'from': frm, 'to': to, 'amount': round(total_amount, 2), 'currency': cur, 'allocs': allocs})
+    if os.environ.get('DEBTS_DEBUG'):
+        print('optimize_transfers_with_allocations detailed=', detailed)
 
     conn.close()
     return detailed
 
 
 def mark_allocations_paid(db_path, transfers_with_allocs):
-    """Применяет аллокации к базе: помечает использованные части как оплаченные.
+    """Применяет аллокации к базе в одной транзакции с проверками.
 
-    Логика:
-    - Для каждой аллокации (ep_id, used): если used >= original_amount - eps => просто обновляем is_paid = 1.
-    - Если used < original_amount: уменьшаем существующую запись до remaining (original-used) и вставляем новую запись с amount=used и is_paid=1.
+    Поведение:
+    - Выполняет BEGIN IMMEDIATE, чтобы избежать конкурентных записей в SQLite.
+    - Для каждой аллокации проверяет, что запись существует и не помечена как оплаченная,
+      и что в ней достаточно суммы для списания.
+    - Если проверка не проходит — откатывает транзакцию и выбрасывает исключение.
+    - В противном случае уменьшает/помечает записи и добавляет запись о погашённой части (is_paid=1) при частичном списании.
     """
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
+    try:
+        # Начинаем немедленную транзакцию (блокировка для записи)
+        conn.execute('BEGIN IMMEDIATE')
 
-    for t in transfers_with_allocs:
-        allocs = t.get('allocs', [])
-        for ep_id, used, expense_id, original in allocs:
-            used = round(float(used), 2)
-            original = float(original)
-            if used >= original - 0.005:
-                # mark original row paid
-                cursor.execute('UPDATE expense_participant SET is_paid = 1 WHERE id = ?', (ep_id,))
-            else:
-                remaining = round(original - used, 2)
-                # reduce original row amount to remaining
-                cursor.execute('UPDATE expense_participant SET amount = ? WHERE id = ?', (remaining, ep_id))
-                # insert a new row representing погашённую часть and mark it paid
-                cursor.execute('INSERT INTO expense_participant (expense_id, user_id, amount, is_paid) VALUES (?, ?, ?, ?)',
-                               (expense_id, t['from'], used, 1))
+        for t in transfers_with_allocs:
+            allocs = t.get('allocs', [])
+            for ep_id, used, expense_id, original in allocs:
+                used = round(float(used), 2)
 
-    conn.commit()
-    conn.close()
+                # Получим текущую запись и проверим состояние
+                cursor.execute('SELECT amount, is_paid, user_id FROM expense_participant WHERE id = ?', (ep_id,))
+                row = cursor.fetchone()
+                if not row:
+                    raise Exception(f'Запись expense_participant id={ep_id} не найдена')
+                cur_amount, cur_is_paid, cur_user_id = row
+                cur_amount = float(cur_amount)
+                if cur_is_paid:
+                    raise Exception(f'Запись expense_participant id={ep_id} уже помечена как оплаченная')
+                if cur_amount + 1e-9 < used:
+                    raise Exception(f'Недостаточно средств в записи id={ep_id}: доступно {cur_amount}, требуется {used}')
+
+                if used >= cur_amount - 0.005:
+                    # Полное списание текущей записи
+                    cursor.execute('UPDATE expense_participant SET is_paid = 1 WHERE id = ?', (ep_id,))
+                else:
+                    # Частичное списание: уменьшаем оригинальную строку и добавляем помеченную часть
+                    remaining = round(cur_amount - used, 2)
+                    cursor.execute('UPDATE expense_participant SET amount = ? WHERE id = ?', (remaining, ep_id))
+                    # Вставляем запись, которая будет помечена как оплаченная
+                    cursor.execute(
+                        'INSERT INTO expense_participant (expense_id, user_id, amount, is_paid) VALUES (?, ?, ?, ?)',
+                        (expense_id, cur_user_id, used, 1)
+                    )
+
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        # Логируем и пробрасываем ошибку дальше
+        print(f"mark_allocations_paid error: {e}")
+        raise
+    finally:
+        conn.close()
 
 
 def mark_all_unpaid_as_paid(db_path='expenses.db'):
