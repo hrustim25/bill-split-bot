@@ -641,7 +641,11 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     state = user_states.get(user.id)
     photos = update.message.photo
     if state == "waiting_title" and photos:
+        wait_message = await update.message.reply_text(
+            f"Обрабатываю изображение..."
+        )
         description, amount = await get_payment_from_photo(update, context)
+        await context.bot.deleteMessage(message_id=wait_message.message_id, chat_id=update.message.chat_id)
         if amount is not None:
             payment = {
                 'description': description,
