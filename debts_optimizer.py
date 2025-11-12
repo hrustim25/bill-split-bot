@@ -222,7 +222,7 @@ def mark_all_unpaid_as_paid(db_path='expenses.db'):
 def get_all_users(db_path='expenses.db'):
     conn = sqlite3.connect(db_path)
     cur = conn.cursor()
-    cur.execute('SELECT id, name FROM user')
+    cur.execute('SELECT id, name, payment_credentials FROM user')
     rows = cur.fetchall()
     conn.close()
-    return [(r[0], r[1]) for r in rows]
+    return [(r[0], r[1], r[2]) for r in rows]

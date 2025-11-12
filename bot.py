@@ -51,7 +51,8 @@ def init_database():
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS user (
             id INTEGER PRIMARY KEY,
-            name TEXT NOT NULL
+            name TEXT NOT NULL,
+            payment_credentials TEXT
         )
     ''')
 
@@ -160,6 +161,7 @@ def get_main_keyboard():
         [KeyboardButton("Создать платеж"), KeyboardButton("Баланс")],
         [KeyboardButton("Мой долг"), KeyboardButton("Общий долг")],
         [KeyboardButton("Мой долг по категориям"), KeyboardButton("Общий долг по категориям")],
+        [KeyboardButton("Указать данные для оплаты"), KeyboardButton("Мои данные для оплаты")],
         [KeyboardButton("История платежей")],
         [KeyboardButton("Оптимизация долгов")]
     ]
@@ -279,6 +281,10 @@ async def handle_main_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE
         await show_my_debt_by_category(update, context)
     elif text == "Общий долг по категориям":
         await show_total_debt_by_category(update, context)
+    elif text == "Указать данные для оплаты":
+        await request_payment_credentials(update, context)
+    elif text == "Мои данные для оплаты":
+        await show_my_payment_credentials(update, context)
 
 async def create_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.message.from_user
@@ -483,7 +489,7 @@ async def show_my_debt(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cursor = conn.cursor()
 
     cursor.execute('''
-        SELECT e.name, ep.amount, e.currency, u_payer.name
+        SELECT e.name, ep.amount, e.currency, u_payer.name, u_payer.payment_credentials
         FROM expense_participant ep
         JOIN expense e ON ep.expense_id = e.id
         JOIN user u_payer ON e.user_id = u_payer.id
@@ -496,8 +502,13 @@ async def show_my_debt(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if debts:
         debt_text = f"Ваши долги, {user.first_name}:\n\n"
         total_by_currency = {}
-        for name, amount, currency, payer_name in debts:
-            debt_text += f"{name}: {amount:.2f} {currency} (кому: {payer_name})\n"
+        for name, amount, currency, payer_name, payment_credentials in debts:
+            payer_info = ''
+            if payment_credentials is None:
+                payer_info = f"{payer_name}"
+            else:
+                payer_info = f"{payer_name} {payment_credentials}"
+            debt_text += f"{name}: {amount:.2f} {currency} (кому: {payer_info})\n"
             total_by_currency[currency] = total_by_currency.get(currency, 0) + float(amount)
         debt_text += "\nИтого:\n"
         for cur, total in total_by_currency.items():
@@ -513,7 +524,7 @@ async def show_total_debt(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cursor = conn.cursor()
 
     cursor.execute('''
-        SELECT u_debtor.name, u_payer.name, SUM(ep.amount) as total_debt, e.currency
+        SELECT u_debtor.name, u_payer.name, u_payer.payment_credentials, SUM(ep.amount) as total_debt, e.currency
         FROM expense_participant ep
         JOIN user u_debtor ON ep.user_id = u_debtor.id
         JOIN expense e ON ep.expense_id = e.id
@@ -528,8 +539,11 @@ async def show_total_debt(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if debts:
         debt_text = "Общие долги:\n\n"
-        for debtor_name, payer_name, total, currency in debts:
+        for debtor_name, payer_name, payer_payment_credentials, total, currency in debts:
             debt_text += f"{debtor_name} → {payer_name}: {float(total):.2f} {currency}\n"
+            if payer_payment_credentials:
+                debt_text += f"Куда: {payer_payment_credentials}\n"
+            debt_text += "\n"
     else:
         debt_text = "Нет активных долгов"
 
@@ -619,11 +633,15 @@ async def handle_unknown_message(update: Update, context: ContextTypes.DEFAULT_T
     user = update.message.from_user
 
     if user.id in user_states:
-        await handle_payment_input(update, context)
-        return
-    else:
-        if update.message.chat.type == "private":
-            await update.message.reply_text("Выберите действие из меню ниже:", reply_markup=get_main_keyboard())
+        if user_states[user.id] == 'waiting_title' or user_states[user.id] == 'waiting_amount':
+            await handle_payment_input(update, context)
+            return
+        elif user_states[user.id] == 'waiting_payment_credentials':
+            await set_payment_credentials(update, context)
+            return
+
+    if update.message.chat.type == "private":
+        await update.message.reply_text("Выберите действие из меню ниже:", reply_markup=get_main_keyboard())
 
 async def get_payment_from_photo(update, context):
     photo = update.message.photo[-1]
@@ -660,6 +678,55 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await update.message.reply_text("Не удалось распознать данные из чека, напишите текстом")
 
+async def request_payment_credentials(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.message.from_user
+    user_states[user.id] = 'waiting_payment_credentials'
+
+    await update.message.reply_text("Введите ваши данные для оплаты:")
+
+async def set_payment_credentials(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.message.from_user
+    payment_credentials = update.message.text
+
+    del user_states[user.id]
+
+    conn = sqlite3.connect('expenses.db')
+    cursor = conn.cursor()
+
+    cursor.execute('''
+        INSERT INTO user (id, name, payment_credentials) VALUES (?, ?, ?)
+        ON CONFLICT DO UPDATE
+        SET payment_credentials = ?
+    ''', (user.id, user.first_name, payment_credentials, payment_credentials))
+
+    conn.commit()
+    conn.close()
+
+    await update.message.reply_text("Платежные данные установлены:\n" + payment_credentials)
+
+async def show_my_payment_credentials(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.message.from_user
+
+    conn = sqlite3.connect('expenses.db')
+    cursor = conn.cursor()
+
+    cursor.execute('''
+        SELECT payment_credentials
+        FROM user
+        WHERE id = ?
+    ''', (user.id,))
+
+    credentials = cursor.fetchall()
+
+    conn.commit()
+    conn.close()
+
+    if not credentials or credentials[0][0] is None:
+        await update.message.reply_text("У вас не указаны платежные данные")
+    else:
+        await update.message.reply_text("Ваши платежные данные:\n" + credentials[0][0])
+
+
 # =========================
 # OPTIMIZER
 # =========================
@@ -693,7 +760,9 @@ async def optimize_debts(update: Update, context: ContextTypes.DEFAULT_TYPE):
         involved.add(t['to'])
 
     try:
-        users = dict(debts_optimizer.get_all_users('expenses.db'))
+        users = dict()
+        for id, name, payment_credentials in debts_optimizer.get_all_users('expenses.db'):
+            users[id] = (name, payment_credentials)
     except Exception:
         users = {}
 
@@ -704,13 +773,32 @@ async def optimize_debts(update: Update, context: ContextTypes.DEFAULT_TYPE):
         label = currency_labels.get(cur, cur)
         lines.append(f'=== {label} ===')
         for t in by_currency[cur]:
-            name_from = html.escape(users.get(t['from'], str(t['from'])))
-            name_to = html.escape(users.get(t['to'], str(t['to'])))
-            lines.append(f"{name_from} -> {name_to}: {t['amount']:.2f} {cur}")
+            name_from, name_to, payment_credentials = '', '', None
+            if t['from'] in users:
+                name_from = users[t['from']][0]
+            else:
+                name_from = str(t['from'])
+            if t['to'] in users:
+                name_to = users[t['to']][0]
+                payment_credentials = users[t['to']][1]
+            else:
+                name_to = str(t['to'])
+            name_from = html.escape(name_from)
+            name_to = html.escape(name_to)
+
+            transfer_info_text = f"{name_from} -> {name_to}: {t['amount']:.2f} {cur}"
+            if payment_credentials:
+                transfer_info_text += f" (Куда: {payment_credentials})"
+            lines.append(transfer_info_text)
 
     mentions = []
     for uid in sorted(involved):
-        pname = html.escape(users.get(uid, str(uid)))
+        pname = ''
+        if uid in users:
+            pname = users[uid][0]
+        else:
+            pname = str(uid)
+        pname = html.escape(pname)
         mentions.append(f'<a href="tg://user?id={uid}">{pname}</a>')
 
     full_text = "\n".join(lines)
@@ -760,7 +848,8 @@ def main():
         filters.Text([
             "Создать платеж", "Баланс", "Мой долг", "Общий долг",
             "История платежей", "Оптимизация долгов",
-            "Мой долг по категориям", "Общий долг по категориям"
+            "Мой долг по категориям", "Общий долг по категориям",
+            "Указать данные для оплаты", "Мои данные для оплаты"
         ]),
         handle_main_buttons
     ))
@@ -768,8 +857,6 @@ def main():
     application.add_handler(CallbackQueryHandler(button_callback))
     # порядок важен: ответ на сообщение -> попытка записать долю
     application.add_handler(MessageHandler(filters.TEXT & filters.REPLY, handle_reply_message))
-    # ввод при создании платежа
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & ~filters.REPLY, handle_payment_input))
     # "непонятные" личные сообщения
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_unknown_message))
     # фото для чеков
